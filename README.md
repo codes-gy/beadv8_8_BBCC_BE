@@ -1,5 +1,65 @@
 # Kidly BE
 
+## 내 담당 (codes-gy)
+
+> 이 저장소는 팀 프로젝트 [prgrms-be-adv-devcourse/beadv8_8_BBCC_BE](https://github.com/prgrms-be-adv-devcourse/beadv8_8_BBCC_BE)의 개인 fork입니다. 아래 코드 링크와 PR 번호는 모두 팀 저장소(upstream `develop`) 기준입니다.
+
+**결제 도메인 담당**. 팀 저장소에 머지된 내 PR은 **169건**(2026-10-08 ~ 2026-11-20)이고, 영역별로는 다음과 같습니다(브랜치 이름의 영역 기준).
+
+| 영역 | 머지된 PR | 추가한 줄 |
+|---|---:|---:|
+| 결제(payment) — 충전 · 결제 · 환불 · 정산 지급 · 아웃박스 | 46 | +20,523 |
+| 공통 · 인프라(global · deploy · infra) — CI, Flyway, k3s 배포, Slack 알림 | 65 | +14,970 |
+| 검색(search) — Elasticsearch 색인, 의미 검색, 장애 대응 | 27 | +10,139 |
+| 챗봇(chatbot) — RAG 챗봇, 상품 · 주문 도구, 남용 방지 | 9 | +5,454 |
+| 그 밖의 도메인(member · order · gateway 등) | 22 | +11,257 |
+
+### 충전 상태 머신
+
+[`Charge`](https://github.com/prgrms-be-adv-devcourse/beadv8_8_BBCC_BE/blob/develop/domains/payment/src/main/java/com/bbcc/kidly/boundedcontext/payment/domain/Charge.java) · [`ChargeConfirmService`](https://github.com/prgrms-be-adv-devcourse/beadv8_8_BBCC_BE/blob/develop/domains/payment/src/main/java/com/bbcc/kidly/boundedcontext/payment/app/ChargeConfirmService.java) · [`ChargeReconcileService`](https://github.com/prgrms-be-adv-devcourse/beadv8_8_BBCC_BE/blob/develop/domains/payment/src/main/java/com/bbcc/kidly/boundedcontext/payment/app/ChargeReconcileService.java) 코드 그대로의 전이입니다.
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: 충전 요청 (1,000 ~ 1,000,000원)
+    PENDING --> CONFIRMING: 금액 대조 후 커밋 (토스 호출 전)
+    PENDING --> FAILED: 결제창 실패 · 취소 (abandon)
+    PENDING --> EXPIRED: 만료 시각 지남 (스케줄러)
+    CONFIRMING --> DONE: 토스 승인 · 재조회 승인<br/>지갑 입금 + 원장 CHARGE
+    CONFIRMING --> FAILED: 토스 거절 · 재조회 거절<br/>관리자 종료(ADMIN_CLOSED)
+    CONFIRMING --> CONFIRMING: 결과 모름(시간 초과 · 5xx)<br/>1분마다 토스 재조회
+    DONE --> CANCELLING: 충전 취소 요청<br/>잔액 먼저 차감
+    CANCELLING --> CANCELLED: 토스 취소 성공
+    CANCELLING --> DONE: 토스 취소 거절<br/>잔액 복구(CHARGE_CANCEL_REVERT)
+    DONE --> CANCELLED: 토스에서 직접 취소(웹훅 → 재조회)
+```
+
+- **외부 호출은 트랜잭션 밖**: `CONFIRMING`을 먼저 커밋하고, 토스 승인은 트랜잭션 밖에서 부른 뒤 결과를 다시 짧은 트랜잭션으로 반영합니다. 외부 응답을 기다리는 동안 DB 커넥션과 락을 잡지 않습니다.
+- **모르면 실패로 만들지 않는다**: 시간 초과 · 5xx는 `PgResult.Unknown`으로 받아 `CONFIRMING`으로 둡니다. 돈이 이미 빠져나갔을 수 있기 때문입니다. 5분 넘게 `CONFIRMING`인 충전은 스케줄러가 1분마다 토스에 다시 조회해 확정합니다.
+- **비관적 락**: 충전은 `findWithLockById` · `findWithLockByTossOrderId`, 지갑은 [`JpaWalletRepository`](https://github.com/prgrms-be-adv-devcourse/beadv8_8_BBCC_BE/blob/develop/domains/payment/src/main/java/com/bbcc/kidly/boundedcontext/payment/out/JpaWalletRepository.java)의 `PESSIMISTIC_WRITE`로 읽어, 사용자 승인 · 스케줄러 · 웹훅이 겹쳐도 차례로 처리합니다. 상태가 기대와 다르면 `INVALID_CHARGE_STATUS`로 막습니다.
+- **마지막 방어선은 DB 제약**: 원장 `wallet_ledger`의 `UNIQUE (type, ref_id)` 때문에 같은 충전이 두 번 입금될 수 없습니다.
+
+### 실패 시나리오
+
+| 상황 | 코드가 하는 일 | 관련 PR |
+|---|---|---|
+| 토스 승인 **시간 초과 · 5xx** | `Unknown`으로 받아 `CONFIRMING` 유지, 사용자에게는 "승인 중" 응답. 스케줄러가 재조회해 승인이면 입금, 거절이면 `FAILED`. 승인 금액이 다르거나 부분 취소된 건은 반영하지 않고 ERROR 로그 → 관리자가 [멈춘 충전 API](https://github.com/prgrms-be-adv-devcourse/beadv8_8_BBCC_BE/pull/1395)로 조회 · 종료(토스 결과를 모르거나 금액대로 승인됐으면 종료 거절) | #65, #166, #1395 |
+| 같은 충전에 **승인 · 재조회 · 웹훅이 겹침** | 충전 · 지갑 비관적 락 + 상태 검사로 하나만 진행, 원장 유니크 키로 이중 입금 차단. 토스 승인 요청에는 주문번호를 `Idempotency-Key`로 보냄 | #129, #166 |
+| 토스 **웹훅 중복 · 위조 본문** | 웹훅 본문을 믿지 않고 토스를 다시 조회해 전액 취소일 때만 반영. `DONE`이 아닌 충전은 넘어가 두 번째 웹훅은 아무것도 안 함. 조회 결과를 모르면 503을 돌려 토스가 다시 보내게 함 | #208 |
+| **Kafka 발행 실패** | 이벤트는 업무와 같은 트랜잭션(`BEFORE_COMMIT`)에서 아웃박스에 저장. 릴레이가 보내다 실패하면 기록하고 멈춰 순서 유지, 시도 상한에 닿은 메시지는 다른 메시지가 나가는 경우(브로커는 정상)에만 **격리**하고 같은 키의 뒤 메시지도 보류 → 관리자가 원인을 고친 뒤 다시 보내기. 보낸 뒤 커밋 전에 멈추면 다시 보내고, 받는 쪽은 `eventId`로 거름 | #563, #1401 |
+| **운영 중 감지** | Grafana 알림: 결제 이벤트 전송 지연 · 격리 · 전송 실패 반복, 결제 수신 메시지 DLT, 30분 넘게 승인 중 · 취소 중인 충전, 환불 재처리 지연 | #981, #1396 |
+
+챗봇은 남용 방지를 맡았습니다: OpenAI에 주문 ID · 수량을 보내지 않기(#1397), 이전 대화를 확인되지 않은 기록으로만 넘기기(#1398), 질문 하나당 시간 상한(#1399), 하루 질문 수 상한(#1400).
+
+### 대표 PR
+
+- [#65 토스페이먼츠 결제 승인 · 취소 · 조회 클라이언트](https://github.com/prgrms-be-adv-devcourse/beadv8_8_BBCC_BE/pull/65) — 결과를 성공 · 거절 · 모름 세 가지로 나눔
+- [#129 예치금 충전 요청 · 승인 API](https://github.com/prgrms-be-adv-devcourse/beadv8_8_BBCC_BE/pull/129) — 승인 3단계(커밋 → 외부 호출 → 반영)
+- [#166 미확정 · 만료 충전 정리 스케줄러](https://github.com/prgrms-be-adv-devcourse/beadv8_8_BBCC_BE/pull/166) — `CONFIRMING` 재조회로 확정
+- [#563 결제 이벤트를 아웃박스로 Kafka에 발행](https://github.com/prgrms-be-adv-devcourse/beadv8_8_BBCC_BE/pull/563)
+- [#1401 결제 아웃박스에서 보낼 수 없는 메시지를 격리](https://github.com/prgrms-be-adv-devcourse/beadv8_8_BBCC_BE/pull/1401)
+
+---
+
 자녀 맞춤 키즈 패션 이커머스 백엔드. Spring Boot 4.1 · Java 25 · PostgreSQL 18 · Kafka 모듈러 모놀리스.
 
 개발 규칙은 [`CLAUDE.md`](CLAUDE.md)를 따른다.
